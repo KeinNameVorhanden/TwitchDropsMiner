@@ -56,6 +56,8 @@ class Websocket:
         self._max_pong: float = self._next_ping + PING_TIMEOUT.total_seconds()
         # main task, responsible for receiving messages, sending them, and websocket ping
         self._handle_task: asyncio.Task[None] | None = None
+        # holds strong references to short-lived fire-and-forget tasks to prevent GC
+        self._background_tasks: set[asyncio.Task[None]] = set()
         # topics stuff
         self.topics: dict[str, WebsocketTopic] = {}
         self._submitted: set[WebsocketTopic] = set()
@@ -107,9 +109,9 @@ class Websocket:
                 self._twitch.gui.websockets.remove(self._idx)
 
     def stop_nowait(self, *, remove: bool = False):
-        # weird syntax but that's what we get for using a decorator for this
-        # return type of 'task_wrapper' is a coro, so we need to instance it for the task
-        asyncio.create_task(task_wrapper(self.stop)(remove=remove))
+        task = asyncio.create_task(task_wrapper(self.stop)(remove=remove))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _backoff_connect(
         self, ws_url: str, **kwargs
@@ -266,12 +268,14 @@ class Websocket:
             else:
                 ws_logger.error(f"Websocket[{self._idx}] error: Unknown message: {raw_message}")
 
-    def _handle_message(self, message):
+    def _handle_message(self, message: JsonType) -> None:
         # request the assigned topic to process the response
         topic = self.topics.get(message["data"]["topic"])
         if topic is not None:
             # use a task to not block the websocket
-            asyncio.create_task(topic(json.loads(message["data"]["message"])))
+            task = asyncio.create_task(topic(json.loads(message["data"]["message"])))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
     async def _handle_recv(self):
         """

@@ -57,7 +57,7 @@
         },
         "login": {
             "name": "Login",
-            "labels": "Status:\nBenutzer ID:",
+            "labels": "Status:\nBenutzer ID:\nBenutzername:",
             "logged_in": "Angemeldet",
             "logged_out": "Abgemeldet",
             "logging_in": "Anmelden...",

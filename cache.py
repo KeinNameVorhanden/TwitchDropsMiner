@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 
 import io
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
     from typing_extensions import TypeAlias
 
 
+logger = logging.getLogger("TwitchDrops")
 ImageHash = NewType("ImageHash", str)
 ImageSize: TypeAlias = "tuple[int, int]"
 
@@ -111,7 +113,7 @@ class ImageCache:
                         if response.status != 404:
                             image = Image_module.open(io.BytesIO(await response.read()))
                 except Exception:
-                    pass
+                    logger.debug(f"Failed to fetch image {url!r}", exc_info=True)
                 if image is None:
                     # use a blank white image as a fallback
                     image = Image_module.new("RGB", (10, 10), (255, 255, 255))

@@ -23,6 +23,7 @@ class SettingsFile(TypedDict):
     enable_badges_emotes: bool
     available_drops_check: bool
     priority_mode: PriorityMode
+    close_on_error: bool
 
 
 default_settings: SettingsFile = {
@@ -37,6 +38,7 @@ default_settings: SettingsFile = {
     "enable_badges_emotes": False,
     "available_drops_check": False,
     "priority_mode": PriorityMode.PRIORITY_ONLY,
+    "close_on_error": True,
 }
 
 

@@ -548,7 +548,7 @@ class LoginForm:
             frame, text=_("gui", "login", "button"), command=self._confirm.set, state="disabled"
         )
         self._button.grid(column=0, row=4, columnspan=2)
-        self.update(_("gui", "login", "logged_out"), None)
+        self.update(_("gui", "login", "logged_out"))
 
     def clear(self, login: bool = False, password: bool = False, token: bool = False):
         clear_all = not login and not password and not token
@@ -568,7 +568,7 @@ class LoginForm:
             self._button.config(state="disabled")
 
     async def ask_login(self) -> LoginData:
-        self.update(_("gui", "login", "required"), None)
+        self.update(_("gui", "login", "required"))
         # ensure the window isn't hidden into tray when this runs
         self._manager.grab_attention(sound=False)
         while True:
@@ -595,7 +595,7 @@ class LoginForm:
             return login_data
 
     async def ask_enter_code(self, page_url: URL, user_code: str) -> None:
-        self.update(_("gui", "login", "required"), None)
+        self.update(_("gui", "login", "required"))
         # ensure the window isn't hidden into tray when this runs
         self._manager.grab_attention(sound=False)
         self._manager.print(_("gui", "login", "request"))
@@ -604,12 +604,11 @@ class LoginForm:
         await asyncio.sleep(4)
         webopen(page_url)
 
-    def update(self, status: str, user_id: int | None):
-        if user_id is not None:
-            user_str = str(user_id)
-        else:
-            user_str = "-"
-        self._var.set(f"{status}\n{user_str}")
+    def update(self, status: str, user_id: int | None = None, user_name: str | None = None):
+        user_id = user_id is None and "-" or str(user_id)
+        user_name = user_name is None and "-" or user_name
+        self._manager._root.title = f"{WINDOW_TITLE} | User: {user_name} ({user_id})"
+        self._var.set(f"{status}\n{user_id}\n{user_name}")
 
 
 class _BaseVars(TypedDict):

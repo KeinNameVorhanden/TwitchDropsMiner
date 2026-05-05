@@ -129,7 +129,7 @@ PING_TIMEOUT = timedelta(seconds=10)
 ONLINE_DELAY = timedelta(seconds=120)
 WATCH_INTERVAL = timedelta(seconds=59)
 # Strings
-WINDOW_TITLE = f"Twitch Drops Miner v{__version__} (by DevilXD)"
+WINDOW_TITLE = f"Twitch Drops Miner v{__version__}"
 # Logging
 LOGGING_LEVELS = {
     0: logging.ERROR,
@@ -260,8 +260,14 @@ class State(Enum):
 
 
 class PriorityMode(Enum):
+    # Mine only games in the priority list; all other games are skipped entirely.
     PRIORITY_ONLY = 0
+    # Mine all non-excluded games; among games at the same priority tier,
+    # prefer campaigns whose end date is soonest.
     ENDING_SOONEST = 1
+    # Mine all non-excluded games; among games at the same priority tier,
+    # prefer campaigns with the lowest availability ratio
+    # (time remaining / minutes still needed — lower means harder to complete in time).
     LOW_AVBL_FIRST = 2
 
 

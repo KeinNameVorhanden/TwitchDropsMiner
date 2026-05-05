@@ -79,14 +79,14 @@ def lock_file(path: Path) -> tuple[bool, io.TextIOWrapper]:
         try:
             # we need to lock at least one byte for this to work
             msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, max(path.stat().st_size, 1))
-        except Exception:
+        except OSError:
             return False, file
         return True, file
     if sys.platform in ("linux", "darwin"):
         import fcntl
         try:
             fcntl.lockf(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except Exception:
+        except OSError:
             return False, file
         return True, file
     # for unsupported systems, just always return True

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import math
 import logging
+from abc import ABC, abstractmethod
 from enum import Enum
 from itertools import chain
 from typing import TYPE_CHECKING
@@ -55,7 +56,7 @@ class Benefit:
         self.image_url: URLType = benefit_data["imageAssetURL"]
 
 
-class BaseDrop:
+class BaseDrop(ABC):
     def __init__(
         self, campaign: DropsCampaign, data: JsonType, claimed_benefits: dict[str, datetime]
     ):
@@ -104,8 +105,8 @@ class BaseDrop:
         campaign = self.campaign
         return all(campaign.timed_drops[pid].is_claimed for pid in self.precondition_drops)
 
-    def _on_state_changed(self) -> None:
-        raise NotImplementedError
+    @abstractmethod
+    def _on_state_changed(self) -> None: ...
 
     def _base_earn_conditions(self) -> bool:
         # define when a drop can be earned or not
@@ -461,7 +462,7 @@ class DropsCampaign:
                     # or this campaign can be earned anywhere (special game)
                     and (
                         ignore_channel_status
-                        or channel.game is not None and channel.game == self.game
+                        or (channel.game is not None and channel.game == self.game)
                         or self.game.is_special_events()
                     )
                 )
@@ -499,8 +500,9 @@ class DropsCampaign:
         )
 
     def bump_minutes(self, channel: Channel) -> None:
-        # NOTE: Use a temporary list to ensure all drops are bumped before checking
-        if any([drop._bump_minutes(channel) for drop in self.drops]):
+        # NOTE: Build the full list first to ensure ALL drops are bumped before any short-circuit
+        bumped = [drop._bump_minutes(channel) for drop in self.drops]
+        if any(bumped):
             # Executes if any drop's extra_current_minutes reach MAX_ESTIMATED_MINUTES
             # TODO: Figure out a better way to handle this case
             logger.warning(

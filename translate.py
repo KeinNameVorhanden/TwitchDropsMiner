@@ -294,7 +294,7 @@ default_translation: Translation = {
         },
         "login": {
             "name": "Login Form",
-            "labels": "Status:\nUser ID:",
+            "labels": "Status:\nUser ID:\nUsername:",
             "logged_in": "Logged in",
             "logged_out": "Logged out",
             "logging_in": "Logging in...",

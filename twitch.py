@@ -371,7 +371,7 @@ class _AuthState:
             # looks like we're missing something
             login_form: LoginForm = self._twitch.gui.login
             logger.info("Checking login")
-            login_form.update(_("gui", "login", "logging_in"), None)
+            login_form.update(_("gui", "login", "logged_in"))
             for client_mismatch_attempt in range(2):
                 for invalid_token_attempt in range(2):
                     cookie = jar.filter_cookies(client_info.CLIENT_URL)
@@ -408,9 +408,12 @@ class _AuthState:
             else:
                 raise RuntimeError("Login verification failure (step #1)")
             self.user_id = int(validate_response["user_id"])
+            self.user_name = str(validate_response["login"])
             cookie["persistent"] = str(self.user_id)
             logger.info(f"Login successful, user ID: {self.user_id}")
-            login_form.update(_("gui", "login", "logged_in"), self.user_id)
+            logger.info(f"User ID: {self.user_id}")
+            logger.info(f"Username: {self.user_name}")
+            login_form.update(_("gui", "login", "logged_in"), self.user_id, self.user_name)
             # update our cookie and save it
             jar.update_cookies(cookie, client_info.CLIENT_URL)
             jar.save(COOKIES_PATH)
@@ -465,7 +468,7 @@ class Twitch:
             # clear the jar, just in case
             cookie_jar.clear()
         # create timeouts
-        # connection quality mulitiplier determines the magnitude of timeouts
+        # connection quality multiplier determines the magnitude of timeouts
         connection_quality = self.settings.connection_quality
         if connection_quality < 1:
             connection_quality = self.settings.connection_quality = 1
@@ -652,27 +655,30 @@ class Twitch:
                 exclude = self.settings.exclude
                 priority = self.settings.priority
                 priority_mode = self.settings.priority_mode
-                priority_only = priority_mode is PriorityMode.PRIORITY_ONLY
                 next_hour = datetime.now(timezone.utc) + timedelta(hours=1)
-                # sorted_campaigns: list[DropsCampaign] = list(self.inventory)
                 sorted_campaigns: list[DropsCampaign] = self.inventory
-                if not priority_only:
-                    if priority_mode is PriorityMode.ENDING_SOONEST:
-                        sorted_campaigns.sort(key=lambda c: c.ends_at)
-                    elif priority_mode is PriorityMode.LOW_AVBL_FIRST:
-                        sorted_campaigns.sort(key=lambda c: c.availability)
-                sorted_campaigns.sort(
-                    key=lambda c: (
+
+                def _campaign_key(c: DropsCampaign):
+                    priority_idx = (
                         priority.index(c.game.name) if c.game.name in priority else MAX_INT
                     )
-                )
+                    if priority_mode is PriorityMode.ENDING_SOONEST:
+                        return (priority_idx, c.ends_at)
+                    elif priority_mode is PriorityMode.LOW_AVBL_FIRST:
+                        return (priority_idx, c.availability)
+                    return (priority_idx, 0)
+
+                sorted_campaigns.sort(key=_campaign_key)
                 for campaign in sorted_campaigns:
                     game: Game = campaign.game
                     if (
                         game not in self.wanted_games  # isn't already there
                         # and isn't excluded by list or priority mode
                         and game.name not in exclude
-                        and (not priority_only or game.name in priority)
+                        and (
+                            priority_mode is not PriorityMode.PRIORITY_ONLY
+                            or game.name in priority
+                        )
                         # and can be progressed within the next hour
                         and campaign.can_earn_within(next_hour)
                     ):

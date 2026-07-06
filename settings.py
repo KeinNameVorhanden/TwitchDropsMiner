@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+import fnmatch
 from typing import Any, TypedDict, TYPE_CHECKING
 
 from yarl import URL
 
 from utils import json_load, json_save
-from constants import SETTINGS_PATH, DEFAULT_LANG, PriorityMode
+from constants import MAX_INT, SETTINGS_PATH, DEFAULT_LANG, PriorityMode
 
 if TYPE_CHECKING:
     from main import ParsedArgs
+
+
+# Glob metacharacters — presence of any of these in a priority/exclude entry
+# turns it into a pattern instead of a literal game name.
+_PATTERN_CHARS = ("*", "?", "[")
+
+# Bounds for the (config-only) ``list_contrast`` setting. 1 = the lightest tint
+# pair (current default — looks correct on most displays); 5 = the most
+# pronounced (helps when the lighter tints are washed out by display gamma /
+# overlay filters / monochrome modes).
+LIST_CONTRAST_MIN = 1
+LIST_CONTRAST_MAX = 5
 
 
 class SettingsFile(TypedDict):
@@ -24,6 +37,7 @@ class SettingsFile(TypedDict):
     available_drops_check: bool
     priority_mode: PriorityMode
     close_on_error: bool
+    list_contrast: int
 
 
 default_settings: SettingsFile = {
@@ -39,6 +53,7 @@ default_settings: SettingsFile = {
     "available_drops_check": False,
     "priority_mode": PriorityMode.PRIORITY_ONLY,
     "close_on_error": True,
+    "list_contrast": LIST_CONTRAST_MIN,
 }
 
 
@@ -101,3 +116,36 @@ class Settings:
     def save(self, *, force: bool = False) -> None:
         if self._altered or force:
             json_save(SETTINGS_PATH, self._settings, sort=True)
+
+    # ------------------------------------------------------------------
+    # Priority / exclude matching helpers
+    #
+    # Entries in ``priority`` and ``exclude`` are normally exact game names,
+    # but any entry containing a glob metacharacter (``*``, ``?``, ``[``)
+    # is treated as an :mod:`fnmatch` pattern (case-sensitive). A single
+    # pattern can therefore stand in for a whole family of titles, e.g.
+    # ``"EA Sports FC *"`` covers FC 24, FC 25, FC 26 without re-editing
+    # the list every season.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def is_pattern_entry(entry: str) -> bool:
+        return any(c in entry for c in _PATTERN_CHARS)
+
+    @staticmethod
+    def match_entry(entry: str, name: str) -> bool:
+        if Settings.is_pattern_entry(entry):
+            return fnmatch.fnmatchcase(name, entry)
+        return entry == name
+
+    def priority_index(self, name: str) -> int:
+        """Index of the first priority entry matching ``name``, or MAX_INT."""
+        for idx, entry in enumerate(self._settings["priority"]):
+            if self.match_entry(entry, name):
+                return idx
+        return MAX_INT
+
+    def has_priority(self, name: str) -> bool:
+        return self.priority_index(name) < MAX_INT
+
+    def is_excluded(self, name: str) -> bool:
+        return any(self.match_entry(entry, name) for entry in self._settings["exclude"])

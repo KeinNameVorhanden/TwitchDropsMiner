@@ -36,7 +36,8 @@ if sys.platform == "darwin":
 from translate import _
 from cache import ImageCache
 from exceptions import MinerException, ExitRequest
-from utils import resource_path, set_root_icon, webopen, Game, _T
+from settings import Settings, LIST_CONTRAST_MIN
+from utils import resource_path, set_root_icon, webopen, task_wrapper, Game, _T
 from constants import (
     MAX_INT,
     SELF_PATH,
@@ -57,10 +58,10 @@ if sys.platform == "win32":
 if TYPE_CHECKING:
     from twitch import Twitch
     from channel import Channel
-    from settings import Settings
     from inventory import DropsCampaign, TimedDrop
 
 
+logger = logging.getLogger("TwitchDrops")
 TK_PADDING = Union[int, Tuple[int, int], Tuple[int, int, int], Tuple[int, int, int, int]]
 DIGITS = ceil(log10(WS_TOPICS_LIMIT))
 
@@ -1337,8 +1338,8 @@ class InventoryOverview:
             and (campaign.active or upcoming and campaign.upcoming or expired and campaign.expired)
             and (
                 excluded or (
-                    campaign.game.name not in self._settings.exclude
-                    and not priority_only or campaign.game.name in self._settings.priority
+                    not self._settings.is_excluded(campaign.game.name)
+                    and not priority_only or self._settings.has_priority(campaign.game.name)
                 )
             )
             and (finished or not campaign.finished)
@@ -1555,6 +1556,725 @@ def proxy_validate(entry: PlaceholderEntry, settings: Settings) -> bool:
     return valid
 
 
+class _GameListsController:
+    """
+    Data layer for the Settings tab's three-column game list editor.
+
+    Owns the bookkeeping for the user's classifications (priority order, the
+    excluded set) and the transient catalog of currently-known games. The view
+    asks for snapshots and issues operations; it never touches Settings
+    directly. Single-classification is enforced — moving a name into one
+    bucket auto-removes it from the other.
+
+    "Stale" entries — names persisted in priority/exclude but absent from the
+    most recent catalog update — are deliberately preserved so that user
+    intent for past or upcoming campaigns survives across runs.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings: Settings = settings
+        self._catalog: set[str] = set()
+        self._linked: set[str] = set()
+        self._catalog_initialized: bool = False
+
+    def update_catalog(
+        self, names: abc.Iterable[str], *, linked: abc.Iterable[str] | None = None
+    ) -> None:
+        # Accumulate to match legacy behavior: once a name has been observed
+        # this run, it remains selectable in Available even if its campaign
+        # later drops out of the inventory snapshot.
+        self._catalog.update(names)
+        if linked is not None:
+            self._linked = set(linked)
+        self._catalog_initialized = True
+
+    def is_stale(self, name: str) -> bool:
+        # Patterns aren't tied to a specific catalog entry — they may match
+        # future games — so they're never marked stale.
+        if Settings.is_pattern_entry(name):
+            return False
+        return self._catalog_initialized and name not in self._catalog
+
+    def is_linked(self, name: str) -> bool:
+        return name in self._linked
+
+    @staticmethod
+    def is_pattern(entry: str) -> bool:
+        return Settings.is_pattern_entry(entry)
+
+    @property
+    def priority(self) -> list[str]:
+        return list(self._settings.priority)
+
+    @property
+    def excluded(self) -> list[str]:
+        return sorted(self._settings.exclude)
+
+    def available(self) -> list[str]:
+        # Filter out anything covered by an existing literal or pattern in
+        # priority/exclude — handled centrally by Settings so the GUI and the
+        # mining loop always agree on what counts as "covered".
+        return sorted(
+            name for name in self._catalog
+            if not self._settings.has_priority(name)
+            and not self._settings.is_excluded(name)
+        )
+
+    def add_to_priority(self, name: str) -> bool:
+        if not name or name in self._settings.priority:
+            return False
+        self._settings.exclude.discard(name)
+        self._settings.priority.append(name)
+        self._settings.alter()
+        return True
+
+    def add_to_excluded(self, name: str) -> bool:
+        if not name or name in self._settings.exclude:
+            return False
+        try:
+            self._settings.priority.remove(name)
+        except ValueError:
+            pass
+        self._settings.exclude.add(name)
+        self._settings.alter()
+        return True
+
+    def remove_from_priority(self, name: str) -> bool:
+        try:
+            self._settings.priority.remove(name)
+        except ValueError:
+            return False
+        self._settings.alter()
+        return True
+
+    def remove_from_excluded(self, name: str) -> bool:
+        if name not in self._settings.exclude:
+            return False
+        self._settings.exclude.discard(name)
+        self._settings.alter()
+        return True
+
+    def move_priority(self, name: str, amount: int) -> int | None:
+        # amount > 0 moves up, amount < 0 moves down (legacy semantics).
+        try:
+            idx = self._settings.priority.index(name)
+        except ValueError:
+            return None
+        max_idx = len(self._settings.priority) - 1
+        new_idx = max(0, min(max_idx, idx - amount))
+        if new_idx == idx:
+            return idx
+        self._settings.priority.pop(idx)
+        self._settings.priority.insert(new_idx, name)
+        self._settings.alter()
+        return new_idx
+
+
+class _GameListsView:
+    """
+    Three-column game-list editor (Priority | Available | Excluded).
+
+    Pure UI: lays out the three listboxes, the inter-list transfer arrows,
+    the priority reorder toolbar, the Available filter entry, and the
+    right-click context menus. Delegates all data mutations to a
+    :class:`_GameListsController`.
+    """
+
+    # Tint palettes indexed by the (config-only) ``list_contrast`` setting.
+    # Index 0 = level 1 (current default, very subtle); higher indices step up
+    # the saturation for displays where the lightest tints look almost white.
+    _PRIORITY_TINTS_LIGHT = ("#e6f4ea", "#cdebd5", "#b5e1c0", "#9bd6aa", "#80cb95")
+    _PRIORITY_TINTS_DARK = ("#1f3527", "#284631", "#31573b", "#3a6845", "#43794f")
+    _EXCLUDED_TINTS_LIGHT = ("#fbeaea", "#f6d4d4", "#f1bdbd", "#eba6a6", "#e58f8f")
+    _EXCLUDED_TINTS_DARK = ("#3a2222", "#4a2a2a", "#5a3232", "#6a3a3a", "#7a4242")
+    _STALE_FG_LIGHT = "#888888"
+    _STALE_FG_DARK = "#7a7a7a"
+    # Glyph prepended to the displayed label for games whose Twitch account
+    # link is already established — the underlying name list is unaffected.
+    _LINKED_PREFIX = "🔗 "
+
+    def __init__(self, master: ttk.Widget, controller: _GameListsController) -> None:
+        self._controller = controller
+        self._dark = False
+        # Cache of the names currently displayed in each list, indexed by
+        # listbox row — avoids parsing decorated strings to recover the
+        # underlying game name.
+        self._priority_names: list[str] = []
+        self._available_names: list[str] = []
+        self._excluded_names: list[str] = []
+        # Last-applied palette so refreshes can re-tint without needing the
+        # full theme dictionary on every call.
+        self._palette = {
+            "bg": "#ffffff", "fg": "#000000",
+            "sel_bg": "#cce5ff", "sel_fg": "#000000",
+        }
+        self._build(master)
+        self.refresh_all()
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+    def _build(self, master: ttk.Widget) -> None:
+        master.columnconfigure(0, weight=1, uniform="lst")
+        master.columnconfigure(2, weight=1, uniform="lst")
+        master.columnconfigure(4, weight=1, uniform="lst")
+        master.rowconfigure(0, weight=1)
+
+        self._priority_list = self._build_priority(master)
+        # Between Priority and Available: ⮜ adds (item travels left into
+        # Priority); ⮞ removes (item travels right back to Available).
+        (
+            self._available_to_priority_btn,
+            self._priority_to_available_btn,
+        ) = self._build_transfer_buttons(
+            master, column=1,
+            in_text="⮜", in_command=self._available_to_priority,
+            out_text="⮞", out_command=self._priority_to_available,
+        )
+        self._available_list = self._build_available(master)
+        # Between Available and Excluded: ⮞ adds; ⮜ removes.
+        (
+            self._available_to_excluded_btn,
+            self._excluded_to_available_btn,
+        ) = self._build_transfer_buttons(
+            master, column=3,
+            in_text="⮞", in_command=self._available_to_excluded,
+            out_text="⮜", out_command=self._excluded_to_available,
+        )
+        self._excluded_list = self._build_excluded(master)
+        self._build_context_menus(master)
+        self._build_pattern_footer(master)
+        self._build_legend(master)
+
+    def _build_priority(self, master: ttk.Widget) -> PaddedListbox:
+        frame = ttk.LabelFrame(
+            master, padding=(4, 0, 4, 4), text=_("gui", "settings", "priority")
+        )
+        frame.grid(column=0, row=0, sticky="nsew", padx=(0, 2))
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        toolbar = ttk.Frame(frame)
+        toolbar.grid(column=0, row=0, sticky="ew", pady=(0, 2))
+        for i in range(4):
+            toolbar.columnconfigure(i, weight=1, uniform="reord")
+        # Order matters — used below to enable/disable on selection edges.
+        self._priority_top_btn = ttk.Button(
+            toolbar, text="⇈", style="Arrow.TButton", width=2,
+            command=partial(self._move_priority, MAX_INT),
+        )
+        self._priority_top_btn.grid(column=0, row=0, sticky="ew")
+        self._priority_up_btn = ttk.Button(
+            toolbar, text="↑", style="Arrow.TButton", width=2,
+            command=partial(self._move_priority, 1),
+        )
+        self._priority_up_btn.grid(column=1, row=0, sticky="ew")
+        self._priority_down_btn = ttk.Button(
+            toolbar, text="↓", style="Arrow.TButton", width=2,
+            command=partial(self._move_priority, -1),
+        )
+        self._priority_down_btn.grid(column=2, row=0, sticky="ew")
+        self._priority_bottom_btn = ttk.Button(
+            toolbar, text="⇊", style="Arrow.TButton", width=2,
+            command=partial(self._move_priority, -MAX_INT),
+        )
+        self._priority_bottom_btn.grid(column=3, row=0, sticky="ew")
+
+        listbox = PaddedListbox(
+            frame, height=14, padding=(1, 0),
+            activestyle="none", selectmode="single",
+            highlightthickness=0, exportselection=False,
+        )
+        listbox.grid(column=0, row=1, sticky="nsew")
+        listbox.bind("<<ListboxSelect>>", lambda _e: self._update_button_state())
+        listbox.bind("<Double-Button-1>", lambda _e: self._priority_to_available())
+        listbox.bind("<Button-3>", self._on_priority_rightclick)
+        return listbox
+
+    def _build_available(self, master: ttk.Widget) -> PaddedListbox:
+        frame = ttk.LabelFrame(
+            master, padding=(4, 0, 4, 4), text=_("gui", "settings", "available")
+        )
+        frame.grid(column=2, row=0, sticky="nsew", padx=2)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        # NOTE: Don't bind a textvariable here. PlaceholderEntry implements its
+        # placeholder by inserting the placeholder string as actual entry
+        # content; a mirrored StringVar would therefore receive the placeholder
+        # text on every focus-out and the filter would wipe the list. Reading
+        # via ``entry.get()`` is safe — that override returns '' while the
+        # placeholder is showing.
+        self._search_entry = PlaceholderEntry(
+            frame, placeholder=_("gui", "settings", "search_placeholder")
+        )
+        self._search_entry.grid(column=0, row=0, sticky="ew", pady=(0, 2))
+        self._search_entry.bind(
+            "<KeyRelease>", lambda _e: self._refresh_available()
+        )
+        # add="+": PlaceholderEntry already binds focus events to manage the
+        # placeholder; we append rather than replace so its handler runs first
+        # and the entry is in a consistent state by the time we read it.
+        self._search_entry.bind(
+            "<FocusOut>", lambda _e: self._refresh_available(), add="+"
+        )
+        self._search_entry.bind(
+            "<FocusIn>", lambda _e: self._refresh_available(), add="+"
+        )
+
+        listbox = PaddedListbox(
+            frame, height=14, padding=(1, 0),
+            activestyle="none", selectmode="single",
+            highlightthickness=0, exportselection=False,
+        )
+        listbox.grid(column=0, row=1, sticky="nsew")
+        listbox.bind("<<ListboxSelect>>", lambda _e: self._update_button_state())
+        listbox.bind("<Double-Button-1>", lambda _e: self._available_to_priority())
+        listbox.bind("<Button-3>", self._on_available_rightclick)
+        return listbox
+
+    def _build_excluded(self, master: ttk.Widget) -> PaddedListbox:
+        frame = ttk.LabelFrame(
+            master, padding=(4, 0, 4, 4), text=_("gui", "settings", "exclude")
+        )
+        frame.grid(column=4, row=0, sticky="nsew", padx=(2, 0))
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        listbox = PaddedListbox(
+            frame, height=14, padding=(1, 0),
+            activestyle="none", selectmode="single",
+            highlightthickness=0, exportselection=False,
+        )
+        listbox.grid(column=0, row=0, sticky="nsew")
+        listbox.bind("<<ListboxSelect>>", lambda _e: self._update_button_state())
+        listbox.bind("<Double-Button-1>", lambda _e: self._excluded_to_available())
+        listbox.bind("<Button-3>", self._on_excluded_rightclick)
+        return listbox
+
+    def _build_transfer_buttons(
+        self,
+        master: ttk.Widget,
+        *,
+        column: int,
+        in_text: str,
+        in_command: abc.Callable[[], Any],
+        out_text: str,
+        out_command: abc.Callable[[], Any],
+    ) -> tuple[ttk.Button, ttk.Button]:
+        frame = ttk.Frame(master)
+        frame.grid(column=column, row=0, padx=2, sticky="ns")
+        # Pad rows above/below so the two buttons sit roughly mid-list.
+        frame.rowconfigure(0, weight=1)
+        frame.rowconfigure(3, weight=1)
+
+        in_btn = ttk.Button(
+            frame, text=in_text, style="Arrow.TButton", width=3, command=in_command
+        )
+        in_btn.grid(column=0, row=1, pady=2)
+        out_btn = ttk.Button(
+            frame, text=out_text, style="Arrow.TButton", width=3, command=out_command
+        )
+        out_btn.grid(column=0, row=2, pady=2)
+        return in_btn, out_btn
+
+    def _build_context_menus(self, master: ttk.Widget) -> None:
+        ctx = lambda key: _("gui", "settings", "context_menu", key)  # noqa: E731
+
+        self._available_menu = tk.Menu(master, tearoff=0)
+        self._available_menu.add_command(
+            label=ctx("add_to_priority"), command=self._available_to_priority
+        )
+        self._available_menu.add_command(
+            label=ctx("add_to_excluded"), command=self._available_to_excluded
+        )
+
+        self._priority_menu = tk.Menu(master, tearoff=0)
+        self._priority_menu.add_command(
+            label=ctx("move_to_top"), command=partial(self._move_priority, MAX_INT)
+        )
+        self._priority_menu.add_command(
+            label=ctx("move_up"), command=partial(self._move_priority, 1)
+        )
+        self._priority_menu.add_command(
+            label=ctx("move_down"), command=partial(self._move_priority, -1)
+        )
+        self._priority_menu.add_command(
+            label=ctx("move_to_bottom"), command=partial(self._move_priority, -MAX_INT)
+        )
+        self._priority_menu.add_separator()
+        self._priority_menu.add_command(
+            label=ctx("move_to_excluded"), command=self._priority_to_excluded
+        )
+        self._priority_menu.add_command(
+            label=ctx("remove"), command=self._priority_to_available
+        )
+
+        self._excluded_menu = tk.Menu(master, tearoff=0)
+        self._excluded_menu.add_command(
+            label=ctx("move_to_priority"), command=self._excluded_to_priority
+        )
+        self._excluded_menu.add_command(
+            label=ctx("remove"), command=self._excluded_to_available
+        )
+
+    def _build_legend(self, master: ttk.Widget) -> None:
+        # Sample chips that mirror the actual list-row styling — each one is
+        # rendered with the same bg/fg combination it represents in the lists,
+        # so the legend itself is the legend.
+        legend = ttk.Frame(master)
+        legend.grid(column=0, row=2, columnspan=5, sticky="w", pady=(6, 0))
+        ttk.Label(
+            legend, text=_("gui", "settings", "legend", "name")
+        ).grid(column=0, row=0, padx=(0, 8))
+
+        chip_kw: dict[str, Any] = {
+            "relief": "solid", "borderwidth": 1, "padx": 8, "pady": 1,
+        }
+        self._legend_priority = tk.Label(
+            legend, text=_("gui", "settings", "legend", "priority"), **chip_kw
+        )
+        self._legend_priority.grid(column=1, row=0, padx=(0, 12))
+        self._legend_excluded = tk.Label(
+            legend, text=_("gui", "settings", "legend", "excluded"), **chip_kw
+        )
+        self._legend_excluded.grid(column=2, row=0, padx=(0, 12))
+        # Stale chip pairs the priority tint with the muted foreground so the
+        # user can see exactly how a stale entry renders inside a list.
+        self._legend_stale = tk.Label(
+            legend, text=_("gui", "settings", "legend", "stale"), **chip_kw
+        )
+        self._legend_stale.grid(column=3, row=0, padx=(0, 12))
+        # Linked chip mirrors the prefix glyph used on the actual rows.
+        self._legend_linked = tk.Label(
+            legend,
+            text=self._LINKED_PREFIX + _("gui", "settings", "legend", "linked"),
+            **chip_kw,
+        )
+        self._legend_linked.grid(column=4, row=0)
+        # Apply default (light) colors immediately; update_dark_mode will
+        # repaint when the theme is finalised.
+        self._apply_legend_colors()
+
+    def _build_pattern_footer(self, master: ttk.Widget) -> None:
+        # Patterns can only be added by typing them — the listboxes alone
+        # can't introduce wildcard entries. This row sits between the lists
+        # (row 0) and the legend (row 2) so it's discoverable but doesn't
+        # crowd the more common point-and-click flow.
+        footer = ttk.Frame(master)
+        footer.grid(column=0, row=1, columnspan=5, sticky="ew", pady=(6, 0))
+        footer.columnconfigure(1, weight=1)
+        ttk.Label(
+            footer, text=_("gui", "settings", "add_pattern")
+        ).grid(column=0, row=0, padx=(0, 6))
+        self._pattern_entry = PlaceholderEntry(
+            footer,
+            placeholder=_("gui", "settings", "add_pattern_placeholder"),
+        )
+        self._pattern_entry.grid(column=1, row=0, sticky="ew", padx=(0, 6))
+        self._pattern_entry.bind("<Return>", lambda _e: self._pattern_to_priority())
+        ttk.Button(
+            footer,
+            text=_("gui", "settings", "to_priority"),
+            command=self._pattern_to_priority,
+        ).grid(column=2, row=0, padx=(0, 4))
+        ttk.Button(
+            footer,
+            text=_("gui", "settings", "to_excluded"),
+            command=self._pattern_to_excluded,
+        ).grid(column=3, row=0)
+
+    def _apply_legend_colors(self) -> None:
+        priority_tint = self._priority_tint()
+        excluded_tint = self._excluded_tint()
+        stale_fg = self._STALE_FG_DARK if self._dark else self._STALE_FG_LIGHT
+        base_fg = self._palette["fg"]
+        bg = self._palette["bg"]
+        self._legend_priority.config(bg=priority_tint, fg=base_fg)
+        self._legend_excluded.config(bg=excluded_tint, fg=base_fg)
+        self._legend_stale.config(bg=priority_tint, fg=stale_fg)
+        # Linked chip uses the base background so it visually matches an
+        # untinted Available row that's been decorated with the link glyph.
+        self._legend_linked.config(bg=bg, fg=base_fg)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def refresh_all(self) -> None:
+        self._refresh_priority()
+        self._refresh_available()
+        self._refresh_excluded()
+        self._update_button_state()
+
+    def clear_selection(self) -> None:
+        for lb in (self._priority_list, self._available_list, self._excluded_list):
+            lb.selection_clear(0, "end")
+        self._update_button_state()
+
+    def update_dark_mode(
+        self, *, bg: str, fg: str, sel_bg: str, sel_fg: str, dark: bool
+    ) -> None:
+        self._dark = dark
+        self._palette = {"bg": bg, "fg": fg, "sel_bg": sel_bg, "sel_fg": sel_fg}
+        for lb in (self._priority_list, self._available_list, self._excluded_list):
+            lb.configure_theme(bg=bg, fg=fg, sel_bg=sel_bg, sel_fg=sel_fg)
+        self._apply_legend_colors()
+        # Re-apply per-row tints with the new palette.
+        self._refresh_priority()
+        self._refresh_excluded()
+        self._refresh_available()
+
+    # ------------------------------------------------------------------
+    # List rendering
+    # ------------------------------------------------------------------
+    def _selected(self, listbox: PaddedListbox, names: list[str]) -> str | None:
+        sel = listbox.curselection()
+        if not sel:
+            return None
+        idx = sel[0]
+        if idx >= len(names):
+            return None
+        return names[idx]
+
+    def _contrast_index(self) -> int:
+        # Resolve the contrast level lazily on each refresh so that a manual
+        # edit to settings.json takes effect on Reload without reopening
+        # the application.
+        try:
+            value = int(self._controller._settings.list_contrast)
+        except (TypeError, ValueError):
+            value = LIST_CONTRAST_MIN
+        return max(0, min(len(self._PRIORITY_TINTS_LIGHT) - 1, value - 1))
+
+    def _priority_tint(self) -> str:
+        palette = self._PRIORITY_TINTS_DARK if self._dark else self._PRIORITY_TINTS_LIGHT
+        return palette[self._contrast_index()]
+
+    def _excluded_tint(self) -> str:
+        palette = self._EXCLUDED_TINTS_DARK if self._dark else self._EXCLUDED_TINTS_LIGHT
+        return palette[self._contrast_index()]
+
+    def _decorate(self, name: str) -> str:
+        # Display-only transformation: linked games get a small lock-link
+        # glyph so the user can spot which campaigns they're already eligible
+        # to mine. Patterns are never linked (they aren't catalog entries),
+        # so this naturally leaves them un-prefixed.
+        if self._controller.is_linked(name):
+            return self._LINKED_PREFIX + name
+        return name
+
+    def _apply_tints(self, listbox: PaddedListbox, names: list[str], tint: str) -> None:
+        stale_fg = self._STALE_FG_DARK if self._dark else self._STALE_FG_LIGHT
+        base_fg = self._palette["fg"]
+        for idx, name in enumerate(names):
+            fg = stale_fg if self._controller.is_stale(name) else base_fg
+            listbox.itemconfig(idx, background=tint, foreground=fg)
+
+    def _refresh_priority(self) -> None:
+        prev = self._selected(self._priority_list, self._priority_names)
+        self._priority_names = self._controller.priority
+        self._priority_list.delete(0, "end")
+        for name in self._priority_names:
+            self._priority_list.insert("end", self._decorate(name))
+        self._apply_tints(self._priority_list, self._priority_names, self._priority_tint())
+        if prev is not None and prev in self._priority_names:
+            new_idx = self._priority_names.index(prev)
+            self._priority_list.selection_set(new_idx)
+            self._priority_list.see(new_idx)
+
+    def _refresh_excluded(self) -> None:
+        prev = self._selected(self._excluded_list, self._excluded_names)
+        self._excluded_names = self._controller.excluded
+        self._excluded_list.delete(0, "end")
+        for name in self._excluded_names:
+            self._excluded_list.insert("end", self._decorate(name))
+        self._apply_tints(self._excluded_list, self._excluded_names, self._excluded_tint())
+        if prev is not None and prev in self._excluded_names:
+            new_idx = self._excluded_names.index(prev)
+            self._excluded_list.selection_set(new_idx)
+            self._excluded_list.see(new_idx)
+
+    def _refresh_available(self) -> None:
+        prev = self._selected(self._available_list, self._available_names)
+        # PlaceholderEntry.get() returns '' while the placeholder is showing,
+        # so an idle / unfocused field naturally yields an unfiltered list.
+        flt = self._search_entry.get().strip().casefold()
+        items = self._controller.available()
+        if flt:
+            items = [n for n in items if flt in n.casefold()]
+        self._available_names = items
+        self._available_list.delete(0, "end")
+        for name in items:
+            self._available_list.insert("end", self._decorate(name))
+        # Available rows have no tint, but reset to base palette in case a
+        # prior render colored them.
+        for idx in range(len(items)):
+            self._available_list.itemconfig(
+                idx, background=self._palette["bg"], foreground=self._palette["fg"]
+            )
+        if prev is not None and prev in items:
+            new_idx = items.index(prev)
+            self._available_list.selection_set(new_idx)
+            self._available_list.see(new_idx)
+        self._update_button_state()
+
+    # ------------------------------------------------------------------
+    # Operations (selection-driven; safe no-ops when nothing is selected)
+    # ------------------------------------------------------------------
+    def _consume_pattern(self) -> str | None:
+        text = self._pattern_entry.get().strip()
+        if not text:
+            return None
+        self._pattern_entry.clear()
+        return text
+
+    def _pattern_to_priority(self) -> None:
+        text = self._consume_pattern()
+        if text and self._controller.add_to_priority(text):
+            self._refresh_priority()
+            self._refresh_available()
+            self._select_in(self._priority_list, self._priority_names, text)
+
+    def _pattern_to_excluded(self) -> None:
+        text = self._consume_pattern()
+        if text and self._controller.add_to_excluded(text):
+            self._refresh_excluded()
+            self._refresh_available()
+            self._select_in(self._excluded_list, self._excluded_names, text)
+
+    def _available_to_priority(self) -> None:
+        name = self._selected(self._available_list, self._available_names)
+        if name and self._controller.add_to_priority(name):
+            self._refresh_priority()
+            self._refresh_available()
+            self._select_in(self._priority_list, self._priority_names, name)
+
+    def _available_to_excluded(self) -> None:
+        name = self._selected(self._available_list, self._available_names)
+        if name and self._controller.add_to_excluded(name):
+            self._refresh_excluded()
+            self._refresh_available()
+            self._select_in(self._excluded_list, self._excluded_names, name)
+
+    def _priority_to_available(self) -> None:
+        name = self._selected(self._priority_list, self._priority_names)
+        if name and self._controller.remove_from_priority(name):
+            self._refresh_priority()
+            self._refresh_available()
+
+    def _excluded_to_available(self) -> None:
+        name = self._selected(self._excluded_list, self._excluded_names)
+        if name and self._controller.remove_from_excluded(name):
+            self._refresh_excluded()
+            self._refresh_available()
+
+    def _priority_to_excluded(self) -> None:
+        name = self._selected(self._priority_list, self._priority_names)
+        if name and self._controller.add_to_excluded(name):
+            self._refresh_priority()
+            self._refresh_excluded()
+            self._select_in(self._excluded_list, self._excluded_names, name)
+
+    def _excluded_to_priority(self) -> None:
+        name = self._selected(self._excluded_list, self._excluded_names)
+        if name and self._controller.add_to_priority(name):
+            self._refresh_priority()
+            self._refresh_excluded()
+            self._select_in(self._priority_list, self._priority_names, name)
+
+    def _move_priority(self, amount: int) -> None:
+        name = self._selected(self._priority_list, self._priority_names)
+        if name is None:
+            return
+        new_idx = self._controller.move_priority(name, amount)
+        if new_idx is None:
+            return
+        self._refresh_priority()
+        self._priority_list.selection_set(new_idx)
+        self._priority_list.see(new_idx)
+        self._update_button_state()
+
+    def _select_in(
+        self, listbox: PaddedListbox, names: list[str], name: str
+    ) -> None:
+        if name not in names:
+            return
+        idx = names.index(name)
+        listbox.selection_clear(0, "end")
+        listbox.selection_set(idx)
+        listbox.see(idx)
+        self._update_button_state()
+
+    # ------------------------------------------------------------------
+    # State management
+    # ------------------------------------------------------------------
+    def _update_button_state(self) -> None:
+        avail_sel = bool(self._available_list.curselection())
+        prio_sel = self._priority_list.curselection()
+        excl_sel = bool(self._excluded_list.curselection())
+
+        self._available_to_priority_btn.config(state="normal" if avail_sel else "disabled")
+        self._available_to_excluded_btn.config(state="normal" if avail_sel else "disabled")
+        self._priority_to_available_btn.config(state="normal" if prio_sel else "disabled")
+        self._excluded_to_available_btn.config(state="normal" if excl_sel else "disabled")
+
+        if prio_sel:
+            idx = prio_sel[0]
+            max_idx = self._priority_list.size() - 1
+            up_state = "normal" if idx > 0 else "disabled"
+            down_state = "normal" if idx < max_idx else "disabled"
+            self._priority_top_btn.config(state=up_state)
+            self._priority_up_btn.config(state=up_state)
+            self._priority_down_btn.config(state=down_state)
+            self._priority_bottom_btn.config(state=down_state)
+        else:
+            for btn in (
+                self._priority_top_btn, self._priority_up_btn,
+                self._priority_down_btn, self._priority_bottom_btn,
+            ):
+                btn.config(state="disabled")
+
+    # ------------------------------------------------------------------
+    # Right-click handling
+    # ------------------------------------------------------------------
+    def _select_at_pointer(
+        self, listbox: PaddedListbox, event: tk.Event[PaddedListbox]
+    ) -> bool:
+        if listbox.size() == 0:
+            return False
+        idx = listbox.nearest(event.y)
+        if idx < 0:
+            return False
+        listbox.selection_clear(0, "end")
+        listbox.selection_set(idx)
+        listbox.activate(idx)
+        self._update_button_state()
+        return True
+
+    def _on_available_rightclick(self, event: tk.Event[PaddedListbox]) -> None:
+        if not self._select_at_pointer(self._available_list, event):
+            return
+        self._available_menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_priority_rightclick(self, event: tk.Event[PaddedListbox]) -> None:
+        if not self._select_at_pointer(self._priority_list, event):
+            return
+        idx = self._priority_list.curselection()[0]
+        max_idx = self._priority_list.size() - 1
+        up_state = "normal" if idx > 0 else "disabled"
+        down_state = "normal" if idx < max_idx else "disabled"
+        self._priority_menu.entryconfig(0, state=up_state)    # move to top
+        self._priority_menu.entryconfig(1, state=up_state)    # move up
+        self._priority_menu.entryconfig(2, state=down_state)  # move down
+        self._priority_menu.entryconfig(3, state=down_state)  # move to bottom
+        self._priority_menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_excluded_rightclick(self, event: tk.Event[PaddedListbox]) -> None:
+        if not self._select_at_pointer(self._excluded_list, event):
+            return
+        self._excluded_menu.tk_popup(event.x_root, event.y_root)
+
+
 class _SettingsVars(TypedDict):
     tray: IntVar
     proxy: StringVar
@@ -1605,12 +2325,15 @@ class SettingsPanel:
                 master, int(self._settings.available_drops_check)
             ),
         }
-        self._game_names: set[str] = set()
-        master.rowconfigure(0, weight=1)
+        self._game_lists_controller = _GameListsController(self._settings)
+        # Top region: General + Advanced side by side; bottom region: the
+        # full-width 3-column game-list editor; footer: Reload.
+        master.rowconfigure(1, weight=1)
         master.columnconfigure(0, weight=1)
-        # use a frame to center the content within the tab
         center_frame = ttk.Frame(master)
-        center_frame.grid(column=0, row=0)
+        center_frame.grid(column=0, row=0, sticky="n")
+        center_frame.columnconfigure(0, weight=0)
+        center_frame.columnconfigure(1, weight=0)
 
         # General section
         general_frame = ttk.LabelFrame(
@@ -1696,11 +2419,12 @@ class SettingsPanel:
         self._proxy.config(validatecommand=partial(proxy_validate, self._proxy, self._settings))
         self._proxy.grid(column=0, row=1)
 
-        # Advanced section
+        # Advanced section — sits to the right of General so the game-list
+        # editor below has the full tab width to itself.
         advanced_frame = ttk.LabelFrame(
             center_frame, padding=(4, 0, 4, 4), text=_("gui", "settings", "advanced", "name")
         )
-        advanced_frame.grid(column=0, row=1, sticky="nsew")
+        advanced_frame.grid(column=1, row=0, sticky="nsew", padx=(8, 0))
         advanced_frame.columnconfigure(0, weight=1)
         advanced_frame.rowconfigure(0, weight=1)
         advanced_center = ttk.Frame(advanced_frame)
@@ -1741,100 +2465,16 @@ class SettingsPanel:
             ),
         ).grid(column=1, row=irow, sticky="w")
 
-        # Priority section
-        priority_frame = ttk.LabelFrame(
-            center_frame, padding=(4, 0, 4, 4), text=_("gui", "settings", "priority")
-        )
-        priority_frame.grid(column=1, row=0, rowspan=2, sticky="nsew")
-        self._priority_entry = PlaceholderCombobox(
-            priority_frame, placeholder=_("gui", "settings", "game_name"), width=30
-        )
-        self._priority_entry.grid(column=0, row=0, sticky="ew")
-        priority_frame.columnconfigure(0, weight=1)
-        ttk.Button(
-            priority_frame, text="➕", command=self.priority_add, width=3, style="Large.TButton"
-        ).grid(column=1, row=0, sticky="nsew")
-        self._priority_list = PaddedListbox(
-            priority_frame,
-            height=12,
-            padding=(1, 0),
-            activestyle="none",
-            selectmode="single",
-            highlightthickness=0,
-            exportselection=False,
-        )
-        self._priority_list.grid(column=0, row=1, rowspan=5, sticky="nsew")
-        self._priority_list.insert("end", *self._settings.priority)
-        weight_scale: int = 5
-        ttk.Button(  # Move to top
-            priority_frame,
-            width=2,
-            text="⇈",
-            style="Arrow.TButton",
-            command=partial(self.priority_move, MAX_INT),
-        ).grid(column=1, row=1, sticky="nsew")
-        priority_frame.rowconfigure(1, weight=1)
-        ttk.Button(  # Move up
-            priority_frame,
-            width=2,
-            text="↑",
-            style="Arrow.TButton",
-            command=partial(self.priority_move, 1),
-        ).grid(column=1, row=2, sticky="nsew")
-        priority_frame.rowconfigure(2, weight=weight_scale)
-        ttk.Button(  # Move down
-            priority_frame,
-            width=2,
-            text="↓",
-            style="Arrow.TButton",
-            command=partial(self.priority_move, -1),
-        ).grid(column=1, row=3, sticky="nsew")
-        priority_frame.rowconfigure(3, weight=weight_scale)
-        ttk.Button(  # Move to bottom
-            priority_frame,
-            width=2,
-            text="⇊",
-            style="Arrow.TButton",
-            command=partial(self.priority_move, -MAX_INT),
-        ).grid(column=1, row=4, sticky="nsew")
-        priority_frame.rowconfigure(4, weight=1)
-        ttk.Button(
-            priority_frame, text="❌", command=self.priority_delete, width=3, style="Large.TButton"
-        ).grid(column=1, row=5, sticky="nsew")
-        priority_frame.rowconfigure(5, weight=1)
+        # Game-lists region — full-width 3-column editor (Priority |
+        # Available | Excluded). The view owns its own widgets/menus and
+        # delegates state to ``self._game_lists_controller``.
+        game_lists_frame = ttk.Frame(master, padding=(0, 8, 0, 0))
+        game_lists_frame.grid(column=0, row=1, sticky="nsew")
+        self._game_lists = _GameListsView(game_lists_frame, self._game_lists_controller)
 
-        # Exclude section
-        exclude_frame = ttk.LabelFrame(
-            center_frame, padding=(4, 0, 4, 4), text=_("gui", "settings", "exclude")
-        )
-        exclude_frame.grid(column=2, row=0, rowspan=2, sticky="nsew")
-        self._exclude_entry = PlaceholderCombobox(
-            exclude_frame, placeholder=_("gui", "settings", "game_name"), width=26
-        )
-        self._exclude_entry.grid(column=0, row=0, sticky="ew")
-        ttk.Button(
-            exclude_frame, text="➕", command=self.exclude_add, width=3, style="Large.TButton"
-        ).grid(column=1, row=0)
-        self._exclude_list = PaddedListbox(
-            exclude_frame,
-            height=12,
-            padding=(1, 0),
-            activestyle="none",
-            selectmode="single",
-            highlightthickness=0,
-            exportselection=False,
-        )
-        self._exclude_list.grid(column=0, row=1, columnspan=2, sticky="nsew")
-        exclude_frame.rowconfigure(1, weight=1)
-        # insert them alphabetically
-        self._exclude_list.insert("end", *sorted(self._settings.exclude))
-        ttk.Button(
-            exclude_frame, text="❌", command=self.exclude_delete, width=3, style="Large.TButton"
-        ).grid(column=0, row=2, columnspan=2, sticky="nsew")
-
-        # Reload button
-        reload_frame = ttk.Frame(center_frame)
-        reload_frame.grid(column=0, row=2, columnspan=3, pady=4)
+        # Reload row
+        reload_frame = ttk.Frame(master)
+        reload_frame.grid(column=0, row=2, pady=4)
         ttk.Label(reload_frame, text=_("gui", "settings", "reload_text")).grid(column=0, row=0)
         ttk.Button(
             reload_frame,
@@ -1845,8 +2485,7 @@ class SettingsPanel:
         self._vars["autostart"].set(self._query_autostart())
 
     def clear_selection(self) -> None:
-        self._priority_list.selection_clear(0, "end")
-        self._exclude_list.selection_clear(0, "end")
+        self._game_lists.clear_selection()
 
     def update_dark_mode(self) -> None:
         self._settings.dark_mode = bool(self._vars["dark_mode"].get())
@@ -1956,84 +2595,11 @@ class SettingsPanel:
             else:
                 plist_file.unlink(missing_ok=True)
 
-    def update_excluded_choices(self) -> None:
-        self._exclude_entry.config(
-            values=sorted(self._game_names.difference(self._settings.exclude))
+    def set_games(self, games: set[Game], *, linked: set[str] | None = None) -> None:
+        self._game_lists_controller.update_catalog(
+            (game.name for game in games), linked=linked
         )
-
-    def update_priority_choices(self) -> None:
-        self._priority_entry.config(
-            values=sorted(self._game_names.difference(self._settings.priority))
-        )
-
-    def set_games(self, games: set[Game]) -> None:
-        self._game_names.update(game.name for game in games)
-        self.update_excluded_choices()
-        self.update_priority_choices()
-
-    def priority_add(self) -> None:
-        game_name: str = self._priority_entry.get()
-        if not game_name:
-            # prevent adding empty strings
-            return
-        self._priority_entry.clear()
-        # add it preventing duplicates
-        try:
-            existing_idx: int = self._settings.priority.index(game_name)
-        except ValueError:
-            # not there, add it
-            self._priority_list.insert("end", game_name)
-            self._priority_list.see("end")
-            self._settings.priority.append(game_name)
-            self._settings.alter()
-            self.update_priority_choices()
-        else:
-            # already there, set the selection on it
-            self._priority_list.selection_set(existing_idx)
-            self._priority_list.see(existing_idx)
-
-    def _priority_idx(self) -> int | None:
-        selection: tuple[int, ...] = self._priority_list.curselection()
-        if not selection:
-            return None
-        return selection[0]
-
-    def priority_move(self, amount: int) -> None:
-        # amount > 0 = up, amount < 0 = down
-        idx: int | None = self._priority_idx()
-        max_idx: int = self._priority_list.size() - 1
-        if (
-            idx is None
-            or amount == 0
-            or amount > 0 and idx == 0
-            or amount < 0 and idx == max_idx
-        ):
-            return
-        insert_idx: int = idx - amount
-        if insert_idx <= 0:
-            insert_idx = 0
-        elif insert_idx >= max_idx:
-            insert_idx = max_idx
-
-        item: str = self._priority_list.get(idx)
-        self._priority_list.delete(idx)
-        self._priority_list.insert(insert_idx, item)
-        # reselect the item and scroll the list if needed
-        self._priority_list.selection_set(insert_idx)
-        self._priority_list.see(insert_idx)
-        # update the underlying settings list too
-        self._settings.priority.pop(idx)
-        self._settings.priority.insert(insert_idx, item)
-        self._settings.alter()
-
-    def priority_delete(self) -> None:
-        idx: int | None = self._priority_idx()
-        if idx is None:
-            return
-        self._priority_list.delete(idx)
-        del self._settings.priority[idx]
-        self._settings.alter()
-        self.update_priority_choices()
+        self._game_lists.refresh_all()
 
     def priority_mode(self, event: tk.Event[ttk.Combobox]) -> None:
         mode_name: str = self._vars["priority_mode"].get()
@@ -2041,49 +2607,6 @@ class SettingsPanel:
             if mode_name == name:
                 self._settings.priority_mode = value
                 break
-
-    def exclude_add(self) -> None:
-        game_name: str = self._exclude_entry.get()
-        if not game_name:
-            # prevent adding empty strings
-            return
-        self._exclude_entry.clear()
-        if game_name not in self._settings.exclude:
-            self._settings.exclude.add(game_name)
-            self._settings.alter()
-            self.update_excluded_choices()
-            # insert it alphabetically
-            for i, item in enumerate(self._exclude_list.get(0, "end")):
-                if game_name < item:
-                    self._exclude_list.insert(i, game_name)
-                    self._exclude_list.see(i)
-                    break
-            else:
-                self._exclude_list.insert("end", game_name)
-                self._exclude_list.see("end")
-        else:
-            # it was already there, select it
-            for i, item in enumerate(self._exclude_list.get(0, "end")):
-                if item == game_name:
-                    existing_idx = i
-                    break
-            else:
-                # something went horribly wrong and it's not there after all - just return
-                return
-            self._exclude_list.selection_set(existing_idx)
-            self._exclude_list.see(existing_idx)
-
-    def exclude_delete(self) -> None:
-        selection: tuple[int, ...] = self._exclude_list.curselection()
-        if not selection:
-            return None
-        idx: int = selection[0]
-        item: str = self._exclude_list.get(idx)
-        if item in self._settings.exclude:
-            self._exclude_list.delete(idx)
-            self._settings.exclude.discard(item)
-            self._settings.alter()
-            self.update_excluded_choices()
 
 
 class HelpTab:
@@ -2096,6 +2619,9 @@ class HelpTab:
         # use a frame to center the content within the tab
         center_frame = ttk.Frame(master)
         center_frame.grid(column=0, row=0)
+        # use a frame for the bottom row specifically
+        bottom_frame = ttk.Frame(master)
+        bottom_frame.grid(column=0, row=1, sticky="nsew")
         irow = 0
         # About
         about = ttk.LabelFrame(center_frame, padding=(4, 0, 4, 4), text="About")
@@ -2159,6 +2685,40 @@ class HelpTab:
         ttk.Label(
             getstarted, text=_("gui", "help", "getting_started_text"), wraplength=self.WIDTH
         ).grid(sticky="nsew")
+        # Invalidate button
+        invalidate_frame = ttk.Frame(bottom_frame)
+        bottom_frame.columnconfigure(0, weight=1)  # center within the column
+        invalidate_frame.grid(column=0, row=0, sticky="nse")
+        ttk.Label(
+            invalidate_frame, text=_("gui", "help", "invalidate", "text")
+        ).grid(column=0, row=0)
+        self._invalidate_button: ttk.Button = ttk.Button(
+            invalidate_frame,
+            text=_("gui", "help", "invalidate", "button"),
+            command=self.invalidate_token,
+            state="disabled",
+        )
+        self._invalidate_button.grid(column=1, row=0)
+
+    def invalidate_token(self) -> None:
+        # sync to async bridge
+        asyncio.create_task(task_wrapper(self._invalidate_token)())
+
+    async def _invalidate_token(self) -> None:
+        auth_state = await self._twitch.get_auth()
+        async with self._twitch.request(
+            "POST",
+            "https://id.twitch.tv/oauth2/revoke",
+            data={
+                "client_id": self._twitch._client_type.CLIENT_ID,
+                "token": auth_state.access_token,
+            }
+        ) as response:
+            if response.status == 200:
+                auth_state.invalidate(delete_cookies=True)
+            else:
+                logger.error(f"Failed to invalidate the auth token: {response.status}")
+        self._twitch.change_state(State.RESTART)
 
 
 ##########################################
@@ -2413,8 +2973,8 @@ class GUIManager:
         if sound:
             self._root.bell()
 
-    def set_games(self, games: set[Game]) -> None:
-        self.settings.set_games(games)
+    def set_games(self, games: set[Game], *, linked: set[str] | None = None) -> None:
+        self.settings.set_games(games, linked=linked)
 
     def display_drop(
         self, drop: TimedDrop, *, countdown: bool = True, subone: bool = False
@@ -2612,12 +3172,9 @@ class GUIManager:
         # Pure Tk widgets
         # Console text
         self.output.configure_theme(bg=surface, fg=fg, sel_bg=sel_bg, sel_fg=sel_fg)
-        # Listboxes
-        self.settings._priority_list.configure_theme(
-            bg=surface, fg=fg, sel_bg=sel_bg, sel_fg=sel_fg
-        )
-        self.settings._exclude_list.configure_theme(
-            bg=surface, fg=fg, sel_bg=sel_bg, sel_fg=sel_fg
+        # Game-list editor (Priority / Available / Excluded listboxes)
+        self.settings._game_lists.update_dark_mode(
+            bg=surface, fg=fg, sel_bg=sel_bg, sel_fg=sel_fg, dark=dark
         )
         # Inventory canvas
         self.inv.configure_theme(bg=bg)

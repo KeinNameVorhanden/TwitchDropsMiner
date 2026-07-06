@@ -180,13 +180,41 @@ class GUIPriorityModes(TypedDict):
     low_availability: str
 
 
+class GUISettingsContextMenu(TypedDict):
+    add_to_priority: str
+    add_to_excluded: str
+    move_to_priority: str
+    move_to_excluded: str
+    move_to_top: str
+    move_up: str
+    move_down: str
+    move_to_bottom: str
+    remove: str
+
+
+class GUISettingsLegend(TypedDict):
+    name: str
+    priority: str
+    excluded: str
+    stale: str
+    linked: str
+
+
 class GUISettings(TypedDict):
     general: GUISettingsGeneral
     advanced: GUISettingsAdvanced
     priority_modes: GUIPriorityModes
+    context_menu: GUISettingsContextMenu
+    legend: GUISettingsLegend
     game_name: str
     priority: str
+    available: str
     exclude: str
+    search_placeholder: str
+    add_pattern: str
+    add_pattern_placeholder: str
+    to_priority: str
+    to_excluded: str
     reload: str
     reload_text: str
 
@@ -197,12 +225,18 @@ class GUIHelpLinks(TypedDict):
     campaigns: str
 
 
+class GUIHelpInvalidate(TypedDict):
+    button: str
+    text: str
+
+
 class GUIHelp(TypedDict):
     links: GUIHelpLinks
     how_it_works: str
     how_it_works_text: str
     getting_started: str
     getting_started_text: str
+    invalidate: GUIHelpInvalidate
 
 
 class GUIMessages(TypedDict):
@@ -393,7 +427,31 @@ default_translation: Translation = {
             },
             "game_name": "Game name",
             "priority": "Priority",
-            "exclude": "Exclude",
+            "available": "Available Games",
+            "exclude": "Excluded",
+            "search_placeholder": "Search games...",
+            "context_menu": {
+                "add_to_priority": "Add to Priority",
+                "add_to_excluded": "Add to Excluded",
+                "move_to_priority": "Move to Priority",
+                "move_to_excluded": "Move to Excluded",
+                "move_to_top": "Move to top",
+                "move_up": "Move up",
+                "move_down": "Move down",
+                "move_to_bottom": "Move to bottom",
+                "remove": "Remove",
+            },
+            "legend": {
+                "name": "Legend:",
+                "priority": "Priority",
+                "excluded": "Excluded",
+                "stale": "Unavailable now",
+                "linked": "Linked account",
+            },
+            "add_pattern": "Add pattern:",
+            "add_pattern_placeholder": "e.g. EA Sports FC *",
+            "to_priority": "→ Priority",
+            "to_excluded": "→ Excluded",
             "reload": "Reload",
             "reload_text": "Most changes require a reload to take an immediate effect: ",
         },
@@ -434,6 +492,10 @@ default_translation: Translation = {
                 "the \"Priority mode\", requires you to press on \"Reload\" "
                 "for the changes to take an effect."
             ),
+            "invalidate": {
+                "button": "Invalidate",
+                "text": "Invalidate the authentication token (log out):",
+            },
         },
     },
 }

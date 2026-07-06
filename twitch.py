@@ -96,6 +96,17 @@ class _AuthState:
             if hasattr(self, attr):
                 delattr(self, attr)
 
+    def invalidate(self, *, delete_cookies: bool = False) -> None:
+        self._delattrs("access_token", "user_id")
+        self._logged_in.clear()
+        self._twitch.gui.help._invalidate_button.config(state="disabled")
+        if delete_cookies:
+            session = self._twitch._session
+            if session is not None:
+                jar = cast(aiohttp.CookieJar, session.cookie_jar)
+                jar.clear()
+                COOKIES_PATH.unlink(missing_ok=True)
+
     def clear(self) -> None:
         self._delattrs(
             "user_id",
@@ -105,6 +116,7 @@ class _AuthState:
             "client_version",
         )
         self._logged_in.clear()
+        self._twitch.gui.help._invalidate_button.config(state="disabled")
 
     async def _oauth_login(self) -> str:
         login_form: LoginForm = self._twitch.gui.login
@@ -417,10 +429,8 @@ class _AuthState:
             # update our cookie and save it
             jar.update_cookies(cookie, client_info.CLIENT_URL)
             jar.save(COOKIES_PATH)
+        self._twitch.gui.help._invalidate_button.config(state="normal")
         self._logged_in.set()
-
-    def invalidate(self):
-        self._delattrs("access_token")
 
 
 class Twitch:
@@ -639,7 +649,10 @@ class Twitch:
                 # ensure the websocket is running
                 await self.websocket.start()
                 await self.fetch_inventory()
-                self.gui.set_games(set(campaign.game for campaign in self.inventory))
+                self.gui.set_games(
+                    set(campaign.game for campaign in self.inventory),
+                    linked={c.game.name for c in self.inventory if c.linked},
+                )
                 # Save state on every inventory fetch
                 self.save()
                 self.change_state(State.GAMES_UPDATE)
@@ -652,16 +665,15 @@ class Twitch:
                                 await drop.claim()
                 # figure out which games we want
                 self.wanted_games.clear()
-                exclude = self.settings.exclude
-                priority = self.settings.priority
-                priority_mode = self.settings.priority_mode
+                settings = self.settings
+                priority_mode = settings.priority_mode
                 next_hour = datetime.now(timezone.utc) + timedelta(hours=1)
                 sorted_campaigns: list[DropsCampaign] = self.inventory
 
                 def _campaign_key(c: DropsCampaign):
-                    priority_idx = (
-                        priority.index(c.game.name) if c.game.name in priority else MAX_INT
-                    )
+                    # Priority entries may be glob patterns (e.g. "EA Sports FC *")
+                    # — Settings.priority_index handles both literals and patterns.
+                    priority_idx = settings.priority_index(c.game.name)
                     if priority_mode is PriorityMode.ENDING_SOONEST:
                         return (priority_idx, c.ends_at)
                     elif priority_mode is PriorityMode.LOW_AVBL_FIRST:
@@ -673,11 +685,11 @@ class Twitch:
                     game: Game = campaign.game
                     if (
                         game not in self.wanted_games  # isn't already there
-                        # and isn't excluded by list or priority mode
-                        and game.name not in exclude
+                        # and isn't excluded by list (literal or pattern) or priority mode
+                        and not settings.is_excluded(game.name)
                         and (
                             priority_mode is not PriorityMode.PRIORITY_ONLY
-                            or game.name in priority
+                            or settings.has_priority(game.name)
                         )
                         # and can be progressed within the next hour
                         and campaign.can_earn_within(next_hour)
@@ -872,6 +884,8 @@ class Twitch:
                     self.print(_("status", "no_channel"))
                     self.change_state(State.IDLE)
                 del new_watching, selected_channel, watching_channel
+            elif self._state is State.RESTART:
+                raise ReloadRequest()
             elif self._state is State.EXIT:
                 self.gui.tray.change_icon("pickaxe")
                 self.gui.status.update(_("gui", "status", "exiting"))
@@ -999,7 +1013,7 @@ class Twitch:
                     and channel.drops_enabled
                     and channel.game in self.wanted_games
                     # let the campaign ignore all channel-related checks
-                    or campaign.game.is_special_events()
+                    or campaign.game.is_special()
                 )
             ):
                 return True
